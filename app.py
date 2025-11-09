@@ -8,197 +8,103 @@ import base64
 import os
 from io import BytesIO
 from PIL import Image
+import torch
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for Flutter
+CORS(app)
 
-# Load model
-MODEL_PATH = "best.pt"
-model = YOLO(MODEL_PATH)
+# Memory optimization
+torch.set_num_threads(1)  # Reduce CPU threads
+os.environ['OMP_NUM_THREADS'] = '1'
 
-# Configuration
-IMG_SIZE = 1024
-CONF_THRESH = 0.01
-MIN_CONF_TO_SAVE = 0.20
-IOU_THRESHOLD = 0.3
+# Load model once at startup
+model = None
 
-class_names = {0: 'low', 1: 'medium', 2: 'high'}
+def load_model():
+    global model
+    if model is None:
+        print("Loading YOLO model...")
+        model = YOLO('best.pt')
+        model.fuse()  # Fuse model for faster inference
+        print("Model loaded successfully")
+    return model
 
-def calculate_iou(box1, box2, img_w, img_h):
-    """Calculate IoU between two boxes in YOLO format (xc, yc, w, h)"""
-    # box format: (class, xc, yc, w, h, conf)
-    x1_1 = (box1[1] - box1[3]/2) * img_w
-    y1_1 = (box1[2] - box1[4]/2) * img_h
-    x2_1 = (box1[1] + box1[3]/2) * img_w
-    y2_1 = (box1[2] + box1[4]/2) * img_h
-    
-    x1_2 = (box2[1] - box2[3]/2) * img_w
-    y1_2 = (box2[2] - box2[4]/2) * img_h
-    x2_2 = (box2[1] + box2[3]/2) * img_w
-    y2_2 = (box2[2] + box2[4]/2) * img_h
-    
-    # Calculate intersection
-    x1_i = max(x1_1, x1_2)
-    y1_i = max(y1_1, y1_2)
-    x2_i = min(x2_1, x2_2)
-    y2_i = min(y2_1, y2_2)
-    
-    if x2_i < x1_i or y2_i < y1_i:
-        return 0.0
-    
-    intersection = (x2_i - x1_i) * (y2_i - y1_i)
-    area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
-    area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-    union = area1 + area2 - intersection
-    
-    return intersection / union if union > 0 else 0.0
-
-def xyxy_to_yolo(x1, y1, x2, y2, w, h):
-    """Convert xyxy format to YOLO format"""
-    xc = ((x1 + x2) / 2) / w
-    yc = ((y1 + y2) / 2) / h
-    ww = (x2 - x1) / w
-    hh = (y2 - y1) / h
-    return xc, yc, ww, hh
-
-def filter_overlapping_boxes(boxes, img_w, img_h):
-    """Filter overlapping boxes, keeping highest severity"""
-    if not boxes:
-        return []
-    
-    filtered_boxes = []
-    # Sort by class descending (2=high, 1=medium, 0=low)
-    sorted_by_severity = sorted(boxes, key=lambda b: b[0], reverse=True)
-    
-    for box in sorted_by_severity:
-        overlaps = False
-        for filtered_box in filtered_boxes:
-            iou = calculate_iou(box, filtered_box, img_w, img_h)
-            if iou > IOU_THRESHOLD:
-                if filtered_box[0] >= box[0]:
-                    overlaps = True
-                    break
-        
-        if not overlaps:
-            filtered_boxes.append(box)
-    
-    return filtered_boxes
-
-@app.route('/')
-def home():
-    return jsonify({
-        'status': 'online',
-        'message': 'Acne Detection API',
-        'endpoints': {
-            '/detect': 'POST - Detect acne in image',
-            '/health': 'GET - Health check'
-        }
-    })
-
-@app.route('/health')
-def health():
-    return jsonify({'status': 'healthy', 'model_loaded': model is not None})
+@app.route('/health', methods=['GET'])
+def health_check():
+    try:
+        m = load_model()
+        return jsonify({
+            'status': 'healthy',
+            'model_loaded': True
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'model_loaded': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/detect', methods=['POST'])
 def detect_acne():
     try:
-        # Check if image is in request
-        if 'image' not in request.files and 'image' not in request.json:
+        # Load model
+        m = load_model()
+        
+        # Get image from request
+        if 'image' in request.files:
+            # File upload
+            file = request.files['image']
+            image = Image.open(file.stream)
+        elif 'image' in request.json:
+            # Base64 string
+            img_data = base64.b64decode(request.json['image'])
+            image = Image.open(BytesIO(img_data))
+        else:
             return jsonify({'error': 'No image provided'}), 400
         
-        # Handle file upload
-        if 'image' in request.files:
-            file = request.files['image']
-            img_bytes = file.read()
-            nparr = np.frombuffer(img_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        # Resize image if too large (save memory)
+        max_size = 640
+        if max(image.size) > max_size:
+            image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
         
-        # Handle base64 image
-        else:
-            image_data = request.json['image']
-            # Remove data:image/jpeg;base64, prefix if present
-            if ',' in image_data:
-                image_data = image_data.split(',')[1]
-            
-            img_bytes = base64.b64decode(image_data)
-            nparr = np.frombuffer(img_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        # Convert to numpy array
+        img_array = np.array(image)
         
-        if img is None:
-            return jsonify({'error': 'Invalid image'}), 400
+        # Run inference with lower image size
+        results = m(img_array, imgsz=320, verbose=False)  # Reduced from 640 to 320
         
-        orig_h, orig_w = img.shape[:2]
-        
-        # Run inference
-        results = model.predict(
-            source=img,
-            imgsz=IMG_SIZE,
-            conf=CONF_THRESH,
-            verbose=False
-        )
-        
-        r = results[0]
-        all_boxes = []
-        
-        # Extract boxes
-        if hasattr(r, 'boxes') and len(r.boxes) > 0:
-            xyxy = r.boxes.xyxy.cpu().numpy()
-            cls = r.boxes.cls.cpu().numpy()
-            confs = r.boxes.conf.cpu().numpy()
-            
-            for (bb, c, conf) in zip(xyxy, cls, confs):
-                x1, y1, x2, y2 = bb
-                xc, yc, ww, hh = xyxy_to_yolo(x1, y1, x2, y2, orig_w, orig_h)
-                all_boxes.append((int(c), xc, yc, ww, hh, float(conf)))
-        
-        # Filter overlapping boxes
-        filtered_boxes = filter_overlapping_boxes(all_boxes, orig_w, orig_h)
-        
-        # Filter by confidence and format response
-        response_boxes = []
-        for box in filtered_boxes:
-            c, xc, yc, w, h, conf = box
-            if conf >= MIN_CONF_TO_SAVE:
-                response_boxes.append({
-                    'class': int(c),
-                    'class_name': class_names.get(int(c), 'unknown'),
-                    'confidence': round(float(conf), 3),
+        # Process results
+        detections = []
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                conf = float(box.conf[0])
+                cls = int(box.cls[0])
+                
+                detections.append({
+                    'class_id': cls,
+                    'class_name': m.names[cls],
+                    'confidence': conf,
                     'bbox': {
-                        'x_center': round(float(xc), 4),
-                        'y_center': round(float(yc), 4),
-                        'width': round(float(w), 4),
-                        'height': round(float(h), 4)
-                    },
-                    # Also provide absolute coordinates
-                    'bbox_absolute': {
-                        'x': int((xc - w/2) * orig_w),
-                        'y': int((yc - h/2) * orig_h),
-                        'width': int(w * orig_w),
-                        'height': int(h * orig_h)
+                        'x1': x1, 'y1': y1,
+                        'x2': x2, 'y2': y2
                     }
                 })
         
-        # Calculate summary statistics
-        summary = {
-            'total_detections': len(response_boxes),
-            'low': sum(1 for b in response_boxes if b['class'] == 0),
-            'medium': sum(1 for b in response_boxes if b['class'] == 1),
-            'high': sum(1 for b in response_boxes if b['class'] == 2)
-        }
-        
         return jsonify({
             'success': True,
-            'image_size': {'width': orig_w, 'height': orig_h},
-            'detections': response_boxes,
-            'summary': summary
-        })
-    
+            'detections': detections,
+            'count': len(detections)
+        }), 200
+        
     except Exception as e:
+        print(f"Error during detection: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    load_model()  # Preload model
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
