@@ -7,12 +7,10 @@ from io import BytesIO
 
 app = Flask(__name__)
 
-
-MODEL_PATH = r"best.pt"  
+MODEL_PATH = r"best.pt"
 IMG_SIZE = 1024
-CONF_THRESH = 0.01  
-MIN_CONF_TO_SAVE = 0.20  
-
+CONF_THRESH = 0.01
+MIN_CONF_TO_SAVE = 0.20
 
 print(f"Loading model from: {MODEL_PATH}")
 model = YOLO(MODEL_PATH)
@@ -26,7 +24,6 @@ def xyxy_to_yolo(x1, y1, x2, y2, w, h):
     return xc, yc, ww, hh
 
 def calculate_iou(box1, box2, orig_w, orig_h):
-    """Calculate IoU between two boxes"""
     x1_1 = (box1[1] - box1[3]/2) * orig_w
     y1_1 = (box1[2] - box1[4]/2) * orig_h
     x2_1 = (box1[1] + box1[3]/2) * orig_w
@@ -53,8 +50,6 @@ def calculate_iou(box1, box2, orig_w, orig_h):
     return intersection / union if union > 0 else 0.0
 
 def process_image(image_bytes):
-    """Process image and return visualization with boxes"""
-    
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     
@@ -69,7 +64,7 @@ def process_image(image_bytes):
         r = results[0]
         orig_h, orig_w = r.orig_shape if hasattr(r, 'orig_shape') else (r.ori_shape[0], r.ori_shape[1])
         
-        all_boxes = []  
+        all_boxes = []
         save_boxes = []
         
         if hasattr(r, 'boxes') and len(r.boxes) > 0:
@@ -87,9 +82,9 @@ def process_image(image_bytes):
                     save_boxes.append(box_data)
         
         class_colors = {
-            0: (0, 255, 0),   
-            1: (255, 0, 0),  
-            2: (0, 0, 255)    
+            0: (0, 255, 0),
+            1: (255, 0, 0),
+            2: (0, 0, 255)
         }
         class_names = {0: 'low', 1: 'medium', 2: 'high'}
         
@@ -100,7 +95,7 @@ def process_image(image_bytes):
             overlaps = False
             for filtered_box in filtered_boxes:
                 iou = calculate_iou(box, filtered_box, orig_w, orig_h)
-                if iou > 0.3:  
+                if iou > 0.3:
                     if filtered_box[0] >= box[0]:
                         overlaps = True
                         break
@@ -115,7 +110,7 @@ def process_image(image_bytes):
             x2 = int((xc + w_rel/2) * orig_w)
             y2 = int((yc + h_rel/2) * orig_h)
             
-            color = class_colors.get(c, (128, 128, 128)) 
+            color = class_colors.get(c, (128, 128, 128))
             thickness = 2 if conf >= MIN_CONF_TO_SAVE else 1
             
             cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
@@ -149,16 +144,6 @@ def process_image(image_bytes):
 
 @app.route('/detect', methods=['POST'])
 def detect():
-    """
-    POST endpoint that accepts an image and returns the image with detection boxes.
-    
-    Usage:
-        curl -X POST -F "image=@path/to/image.jpg" http://localhost:5000/detect --output result.jpg
-    
-    Or with metadata:
-        curl -X POST -F "image=@path/to/image.jpg" -F "return_metadata=true" http://localhost:5000/detect
-    """
-    
     if 'image' not in request.files:
         return jsonify({'error': 'No image file provided'}), 400
     
@@ -168,7 +153,6 @@ def detect():
         return jsonify({'error': 'No selected file'}), 400
     
     try:
-        # Read image bytes
         image_bytes = file.read()
         
         result_image, metadata = process_image(image_bytes)
@@ -195,9 +179,96 @@ def detect():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/detect_raw', methods=['POST'])
+def detect_raw():
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image file provided'}), 400
+    
+    file = request.files['image']
+    
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    
+    try:
+        image_bytes = file.read()
+        
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if img is None:
+            raise ValueError("Invalid image data")
+        
+        temp_path = "temp_image_raw.jpg"
+        cv2.imwrite(temp_path, img)
+        
+        try:
+            results = model.predict(source=temp_path, imgsz=IMG_SIZE, conf=CONF_THRESH, verbose=False)
+            r = results[0]
+            orig_h, orig_w = r.orig_shape if hasattr(r, 'orig_shape') else (r.ori_shape[0], r.ori_shape[1])
+            
+            all_boxes = []
+            class_names = {0: 'low', 1: 'medium', 2: 'high'}
+            
+            if hasattr(r, 'boxes') and len(r.boxes) > 0:
+                xyxy = r.boxes.xyxy.cpu().numpy()
+                cls = r.boxes.cls.cpu().numpy()
+                confs = r.boxes.conf.cpu().numpy()
+                
+                for (bb, c, conf) in zip(xyxy, cls, confs):
+                    x1, y1, x2, y2 = bb
+                    xc, yc, ww, hh = xyxy_to_yolo(x1, y1, x2, y2, orig_w, orig_h)
+                    box_data = (int(c), xc, yc, ww, hh, float(conf))
+                    all_boxes.append(box_data)
+            
+            filtered_boxes = []
+            sorted_by_severity = sorted(all_boxes, key=lambda b: b[0], reverse=True)
+            
+            for box in sorted_by_severity:
+                overlaps = False
+                for filtered_box in filtered_boxes:
+                    iou = calculate_iou(box, filtered_box, orig_w, orig_h)
+                    if iou > 0.3:
+                        if filtered_box[0] >= box[0]:
+                            overlaps = True
+                            break
+                
+                if not overlaps:
+                    filtered_boxes.append(box)
+            
+            detections = []
+            for b in filtered_boxes:
+                c, xc, yc, w_rel, h_rel, conf = b
+                x1 = round((xc - w_rel/2) * orig_w, 2)
+                y1 = round((yc - h_rel/2) * orig_h, 2)
+                x2 = round((xc + w_rel/2) * orig_w, 2)
+                y2 = round((yc + h_rel/2) * orig_h, 2)
+                
+                detections.append({
+                    "bbox": {
+                        "x1": x1,
+                        "y1": y1,
+                        "x2": x2,
+                        "y2": y2
+                    },
+                    "class_id": c,
+                    "class_name": class_names.get(c, 'unknown'),
+                    "confidence": round(conf, 3)
+                })
+            
+            return jsonify({
+                "count": len(detections),
+                "detections": detections
+            })
+            
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
         'model_loaded': model is not None,
