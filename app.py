@@ -4,17 +4,25 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 from io import BytesIO
+import gc
 
 app = Flask(__name__)
 
 MODEL_PATH = r"best.pt"
-IMG_SIZE = 1024
+IMG_SIZE = 640
 CONF_THRESH = 0.01
 MIN_CONF_TO_SAVE = 0.20
 
-print(f"Loading model from: {MODEL_PATH}")
-model = YOLO(MODEL_PATH)
-print(f"Model loaded. Classes: {model.names}\n")
+model = None
+
+def load_model():
+    global model
+    if model is None:
+        print(f"Loading model from: {MODEL_PATH}")
+        model = YOLO(MODEL_PATH)
+        model.fuse()
+        print(f"Model loaded. Classes: {model.names}\n")
+    return model
 
 def xyxy_to_yolo(x1, y1, x2, y2, w, h):
     xc = ((x1 + x2) / 2) / w
@@ -56,11 +64,10 @@ def process_image(image_bytes):
     if img is None:
         raise ValueError("Invalid image data")
     
-    temp_path = "temp_image.jpg"
-    cv2.imwrite(temp_path, img)
+    m = load_model()
     
     try:
-        results = model.predict(source=temp_path, imgsz=IMG_SIZE, conf=CONF_THRESH, verbose=False)
+        results = m.predict(source=img, imgsz=IMG_SIZE, conf=CONF_THRESH, verbose=False, device='cpu')
         r = results[0]
         orig_h, orig_w = r.orig_shape if hasattr(r, 'orig_shape') else (r.ori_shape[0], r.ori_shape[1])
         
@@ -136,11 +143,14 @@ def process_image(image_bytes):
                 'mean': float(np.mean(confs))
             }
         
+        del results
+        gc.collect()
+        
         return img_bytes, metadata
         
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+    except Exception as e:
+        gc.collect()
+        raise e
 
 @app.route('/detect', methods=['POST'])
 def detect():
@@ -198,11 +208,10 @@ def detect_raw():
         if img is None:
             raise ValueError("Invalid image data")
         
-        temp_path = "temp_image_raw.jpg"
-        cv2.imwrite(temp_path, img)
+        m = load_model()
         
         try:
-            results = model.predict(source=temp_path, imgsz=IMG_SIZE, conf=CONF_THRESH, verbose=False)
+            results = m.predict(source=img, imgsz=IMG_SIZE, conf=CONF_THRESH, verbose=False, device='cpu')
             r = results[0]
             orig_h, orig_w = r.orig_shape if hasattr(r, 'orig_shape') else (r.ori_shape[0], r.ori_shape[1])
             
@@ -255,14 +264,17 @@ def detect_raw():
                     "confidence": round(conf, 3)
                 })
             
+            del results
+            gc.collect()
+            
             return jsonify({
                 "count": len(detections),
                 "detections": detections
             })
             
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+        except Exception as e:
+            gc.collect()
+            raise e
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
